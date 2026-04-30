@@ -318,7 +318,7 @@ def main() -> None:
                 )
 
             # Guard: ensure agent actually made commits
-            ahead = capture_cmd(["git", "rev-list", "--count", "origin/main..HEAD"], cwd=repo_dir)
+            ahead = capture_cmd(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo_dir)
             if ahead == "0":
                 raise RuntimeError("Agent made no commits — nothing to push")
 
