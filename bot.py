@@ -205,7 +205,7 @@ def run_agent(idea: dict, repo_dir: str) -> None:
         "- After committing, stop calling tools and give a short plain-text summary"
     )
     user_msg = (
-        f"Project: {idea['feature_name']}\n"
+        f"Project: {idea.get('project') or idea.get('feature_name', '')}\n"
         f"Title: {idea['title']}\n\n"
         f"{idea.get('body', '')}"
     )
@@ -248,7 +248,7 @@ def build_pr_body(idea: dict) -> str:
         f"## AI-generated implementation\n\n"
         f"This PR was created automatically by **ideas-bot** from the Ideas board.\n\n"
         f"**Idea:** {idea['title']}  \n"
-        f"**Project:** {idea['feature_name']}  \n"
+        f"**Project:** {idea.get('project') or idea.get('feature_name', '')}  \n"
         f"**Idea ID:** `{idea['id']}`\n\n"
         f"### Description\n\n"
         f"{idea.get('body', '_No description provided._')}\n\n"
@@ -273,9 +273,9 @@ def main() -> None:
         set_bot_status("failed", error=f"Could not fetch idea: {exc}")
         sys.exit(1)
 
-    log.info(f"Idea: {idea['title']} (project: {idea['feature_name']})")
+    log.info(f"Idea: {idea['title']} (project: {idea.get('project') or idea.get('feature_name', '')})")
 
-    repo_name = REPO_MAP.get(idea["feature_name"], "my-website")
+    repo_name = REPO_MAP.get(idea.get("project") or idea.get("feature_name", ""), "my-website")
     repo_slug = f"{GITHUB_USERNAME}/{repo_name}"
     log.info(f"Target repo: {repo_slug}")
 
