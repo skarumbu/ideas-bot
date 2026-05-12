@@ -1,4 +1,4 @@
-name: Build and Deploy
+﻿name: Build and Deploy
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
             --name ideas-bot-prod \
             --resource-group my-website-prod-rg \
             --image ${{ secrets.ACR_LOGIN_SERVER }}/ideas-bot:sha-$SHORT_SHA \
-            2>/dev/null || echo "Job not yet deployed — image will be set on next Bicep deploy"
+            2>/dev/null || echo "Job not yet deployed â€” image will be set on next Bicep deploy"
 
   update-architecture:
     needs: build-and-deploy
@@ -74,5 +74,5 @@ jobs:
       commit_sha: ${{ github.sha }}
       commit_message: ${{ github.event.head_commit.message }}
     secrets:
-      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      ARCH_CONTENT_FOUNDRY_KEY: ${{ secrets.ARCH_CONTENT_FOUNDRY_KEY }}
       ARCH_UPDATE_GH_TOKEN: ${{ secrets.DESIGN_DOC_GH_TOKEN }}
