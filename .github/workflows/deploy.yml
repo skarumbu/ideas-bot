@@ -65,3 +65,14 @@ jobs:
           git diff --staged --quiet && exit 0
           git commit -m "chore: update ideas-bot deploy metadata"
           git push
+
+  update-arch-content:
+    needs: update-architecture
+    uses: skarumbu/my-website/.github/workflows/arch-content-update-reusable.yml@main
+    with:
+      repo_name: ideas-bot
+      commit_sha: ${{ github.sha }}
+      commit_message: ${{ github.event.head_commit.message }}
+    secrets:
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      ARCH_UPDATE_GH_TOKEN: ${{ secrets.DESIGN_DOC_GH_TOKEN }}
