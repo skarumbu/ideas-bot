@@ -6,20 +6,20 @@ result back to ideas-api.
 """
 
 import json
-import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import traceback
 from datetime import date
 from pathlib import Path
 
 import requests
 from openai import AzureOpenAI
+from shared_logging import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("ideas-bot")
+log = get_logger("ideas-bot")
 
 # ── Environment variables ──────────────────────────────────────────────────────
 IDEA_ID               = os.environ["IDEA_ID"]
@@ -114,7 +114,15 @@ def set_bot_status(status: str, pr_url: str | None = None, error: str | None = N
         resp.raise_for_status()
         log.info(f"set_bot_status → {status}")
     except Exception as exc:
-        log.error(f"Failed to write bot status: {exc}")
+        log.error(f"Failed to write bot status: {exc}", extra={
+            "event": "error",
+            "endpoint": f"/api/ideas/{IDEA_ID}/bot",
+            "method": "PATCH",
+            "status": 500,
+            "message": f"Failed to write bot status: {exc}",
+            "error_type": type(exc).__name__,
+            "duration_ms": 0,
+        })
 
 
 def fetch_idea() -> dict:
@@ -269,7 +277,15 @@ def main() -> None:
     try:
         idea = fetch_idea()
     except Exception as exc:
-        log.error(f"Failed to fetch idea: {exc}")
+        log.error(f"Failed to fetch idea: {exc}", extra={
+            "event": "error",
+            "endpoint": "/api/ideas",
+            "method": "GET",
+            "status": 500,
+            "message": f"Failed to fetch idea: {exc}",
+            "error_type": type(exc).__name__,
+            "duration_ms": 0,
+        })
         set_bot_status("failed", error=f"Could not fetch idea: {exc}")
         sys.exit(1)
 
@@ -346,7 +362,16 @@ def main() -> None:
             set_bot_status("completed", pr_url=pr_url.strip())
 
         except Exception as exc:
-            log.error(f"Bot failed: {exc}", exc_info=True)
+            log.error(str(exc), extra={
+                "event": "error",
+                "endpoint": "/job/ideas-bot",
+                "method": "JOB",
+                "status": 500,
+                "message": str(exc),
+                "error_type": type(exc).__name__,
+                "stack_trace": traceback.format_exc()[:2000],
+                "duration_ms": 0,
+            })
             set_bot_status("failed", error=str(exc))
             sys.exit(1)
 
