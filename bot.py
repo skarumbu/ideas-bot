@@ -210,8 +210,9 @@ def dispatch_tool(tool_call, repo_dir: str) -> str:
         elif name == "write_file":
             path = Path(repo_dir) / args["path"]
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(args["content"])
-            return f"Written {len(args['content'])} chars to {args['path']}"
+            content = args["content"].replace('\x00', '')
+            path.write_text(content)
+            return f"Written {len(content)} chars to {args['path']}"
 
         else:
             return f"Error: unknown tool '{name}'"
