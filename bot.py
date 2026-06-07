@@ -111,7 +111,7 @@ def fetch_updates(idea_id: str) -> list[dict]:
 def post_bot_update(idea_id: str, text: str) -> None:
     requests.post(
         f"{IDEAS_API_URL}/api/ideas/{idea_id}/updates",
-        json={"body": text, "author": "bot"},
+        json={"content": text, "author": "bot"},
         headers=_machine_headers(),
         timeout=15,
     ).raise_for_status()
