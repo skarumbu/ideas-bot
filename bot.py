@@ -253,6 +253,81 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
     return data.get("clear", True), data.get("question")
 
 
+# ── build verification ────────────────────────────────────────────────────────
+def verify_and_fix_build(idea: dict, repo_dir: str) -> None:
+    """Run the project build after agent commits. On failure, give the agent one repair round."""
+    if not (Path(repo_dir) / "package.json").exists():
+        return
+
+    log.info("Running build verification…")
+    result = subprocess.run(
+        ["npm", "run", "build", "--if-present"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "CI": "false"},
+    )
+    if result.returncode == 0:
+        log.info("Build passed")
+        return
+
+    build_output = (result.stdout + result.stderr)[-3000:]
+    log.warning(f"Build failed — attempting repair\n{build_output}")
+
+    # One targeted repair round
+    repair_messages: list = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert software engineer. The code you just committed has build errors. "
+                "Fix them using the provided tools. "
+                "When fixed, run: git add -A && git commit -m 'bot: fix build errors'"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Fix these build errors:\n\n```\n{build_output}\n```",
+        },
+    ]
+    for round_num in range(15):
+        log.info(f"Repair round {round_num + 1}")
+        response = oai.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=repair_messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=8096,
+        )
+        msg = response.choices[0].message
+        repair_messages.append(msg)
+        if not msg.tool_calls:
+            log.info(f"Repair agent finished: {msg.content[:200] if msg.content else '(no text)'}")
+            break
+        for tc in msg.tool_calls:
+            tool_result = dispatch_tool(tc, repo_dir)
+            repair_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_result,
+            })
+
+    # Re-verify after repair
+    result2 = subprocess.run(
+        ["npm", "run", "build", "--if-present"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "CI": "false"},
+    )
+    if result2.returncode != 0:
+        raise RuntimeError(
+            f"Build still failing after repair attempt:\n{(result2.stdout + result2.stderr)[-2000:]}"
+        )
+    log.info("Build passed after repair")
+
+
 # ── agent loop ─────────────────────────────────────────────────────────────────
 def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
     system = (
@@ -263,7 +338,9 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
         "- Make production-quality changes only to files relevant to this feature\n"
         "- Do NOT refactor unrelated code\n"
         "- Write or update tests where the project already has them\n"
-        "- When done, run: git add -A && git commit -m 'bot: <concise summary>'\n"
+        "- If you add a new import or dependency, check package.json first to confirm it is "
+        "already listed; if not, run: npm install <package> --save (or --save-dev for types)\n"
+        "- When done, commit: git add -A && git commit -m 'bot: <concise summary>'\n"
         "- Do NOT push — the orchestrator handles that\n"
         "- After committing, stop calling tools and give a short plain-text summary"
     )
@@ -414,6 +491,9 @@ def main() -> None:
                         ["git", "commit", "-m", f"bot: implement '{idea['title']}' (AI-generated)"],
                         cwd=repo_dir,
                     )
+
+                # Build verification — catches missing deps and type errors before push
+                verify_and_fix_build(idea, repo_dir)
 
                 # Guard: ensure agent actually made commits
                 ahead = capture_cmd(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo_dir)
