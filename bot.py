@@ -31,14 +31,6 @@ AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "o3-mini")
 GITHUB_PAT            = os.environ["GITHUB_PAT"]
 GITHUB_USERNAME       = os.environ.get("GITHUB_USERNAME", "skarumbu")
 
-# ── Project → repo mapping ─────────────────────────────────────────────────────
-REPO_MAP = {
-    "Digits":       "digits",
-    "NBA Games":    "momentum_finder",
-    "Trail Finder": "trail_finder",
-    "Ideas":        "ideas-api",
-    "Dashboard":    "dashboard_api",
-}
 
 # ── Azure OpenAI client ────────────────────────────────────────────────────────
 oai = AzureOpenAI(
@@ -142,6 +134,19 @@ def set_bot_status(status: str, pr_url: str | None = None, error: str | None = N
             "error_type": type(exc).__name__,
             "duration_ms": 0,
         })
+
+
+def fetch_project_repos(project_name: str) -> list[str]:
+    resp = requests.get(
+        f"{IDEAS_API_URL}/api/projects",
+        headers=_machine_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    for p in resp.json().get("projects", []):
+        if p["name"] == project_name:
+            return p.get("repos") or []
+    return []
 
 
 def fetch_idea() -> dict:
@@ -343,9 +348,13 @@ def main() -> None:
 
     log.info(f"Idea: {idea['title']} (project: {idea.get('project') or idea.get('feature_name', '')})")
 
-    repo_name = REPO_MAP.get(idea.get("project") or idea.get("feature_name", ""), "my-website")
-    repo_slug = f"{GITHUB_USERNAME}/{repo_name}"
-    log.info(f"Target repo: {repo_slug}")
+    project_name = idea.get("project") or idea.get("feature_name", "")
+    repos = fetch_project_repos(project_name)
+    if not repos:
+        set_bot_status("failed", error=f"Project '{project_name}' has no repos configured. Add repos in the Ideas app.")
+        log.error(f"No repos configured for project '{project_name}'")
+        sys.exit(1)
+    log.info(f"Target repos: {repos}")
 
     set_bot_status("running")
 
@@ -364,85 +373,89 @@ def main() -> None:
         log.info("Idea needs clarification — bot pausing")
         sys.exit(0)
 
-    with tempfile.TemporaryDirectory(prefix="ideas-bot-") as work_dir:
-        repo_dir = str(Path(work_dir) / "repo")
-        safe_title = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower())[:40].strip("-")
-        model_slug = re.sub(r"[^a-z0-9]+", "-", AZURE_OPENAI_DEPLOYMENT.lower())
-        branch = f"bot/{date.today().isoformat()}-{model_slug}-{safe_title}"
+    safe_title = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower())[:40].strip("-")
+    model_slug = re.sub(r"[^a-z0-9]+", "-", AZURE_OPENAI_DEPLOYMENT.lower())
+    branch = f"bot/{date.today().isoformat()}-{model_slug}-{safe_title}"
+    prior_updates = fetch_updates(IDEA_ID)
+    pr_urls = []
 
-        try:
-            # Clone
-            log.info(f"Cloning {repo_slug}…")
-            run_cmd(
-                ["git", "clone",
-                 f"https://x-access-token:{GITHUB_PAT}@github.com/{repo_slug}.git",
-                 "repo"],
-                cwd=work_dir,
-                timeout=120,
-            )
+    for repo_slug in repos:
+        with tempfile.TemporaryDirectory(prefix="ideas-bot-") as work_dir:
+            repo_dir = str(Path(work_dir) / "repo")
 
-            # Git identity
-            run_cmd(["git", "config", "user.name", "ideas-bot[bot]"], cwd=repo_dir)
-            run_cmd(["git", "config", "user.email", "ideas-bot[bot]@users.noreply.github.com"], cwd=repo_dir)
-
-            # Feature branch
-            run_cmd(["git", "checkout", "-b", branch], cwd=repo_dir)
-
-            # Run agent
-            log.info(f"Running agent ({AZURE_OPENAI_DEPLOYMENT})…")
-            prior_updates = fetch_updates(IDEA_ID)
-            run_agent(idea, repo_dir, prior_updates)
-
-            # Catch any uncommitted stragglers
-            uncommitted = capture_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
-            if uncommitted:
-                run_cmd(["git", "add", "-A"], cwd=repo_dir)
+            try:
+                # Clone
+                log.info(f"Cloning {repo_slug}…")
                 run_cmd(
-                    ["git", "commit", "-m", f"bot: implement '{idea['title']}' (AI-generated)"],
-                    cwd=repo_dir,
+                    ["git", "clone",
+                     f"https://x-access-token:{GITHUB_PAT}@github.com/{repo_slug}.git",
+                     "repo"],
+                    cwd=work_dir,
+                    timeout=120,
                 )
 
-            # Guard: ensure agent actually made commits
-            ahead = capture_cmd(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo_dir)
-            if ahead == "0":
-                raise RuntimeError("Agent made no commits — nothing to push")
+                # Git identity
+                run_cmd(["git", "config", "user.name", "ideas-bot[bot]"], cwd=repo_dir)
+                run_cmd(["git", "config", "user.email", "ideas-bot[bot]@users.noreply.github.com"], cwd=repo_dir)
 
-            # Push
-            run_cmd(
-                ["git", "push", "origin", branch],
-                cwd=repo_dir,
-                extra_env={"GIT_TERMINAL_PROMPT": "0"},
-            )
+                # Feature branch
+                run_cmd(["git", "checkout", "-b", branch], cwd=repo_dir)
 
-            # Open draft PR via gh CLI (GH_TOKEN env var set from GITHUB_PAT in container)
-            pr_url = capture_cmd(
-                [
-                    "gh", "pr", "create",
-                    "--draft",
-                    "--base", "main",
-                    "--head", branch,
-                    "--title", f"bot [{AZURE_OPENAI_DEPLOYMENT}]: {idea['title']}",
-                    "--body", build_pr_body(idea),
-                ],
-                cwd=repo_dir,
-            )
-            log.info(f"PR created: {pr_url}")
+                # Run agent
+                log.info(f"Running agent ({AZURE_OPENAI_DEPLOYMENT}) on {repo_slug}…")
+                run_agent(idea, repo_dir, prior_updates)
 
-            set_bot_status("completed", pr_url=pr_url.strip())
+                # Catch any uncommitted stragglers
+                uncommitted = capture_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
+                if uncommitted:
+                    run_cmd(["git", "add", "-A"], cwd=repo_dir)
+                    run_cmd(
+                        ["git", "commit", "-m", f"bot: implement '{idea['title']}' (AI-generated)"],
+                        cwd=repo_dir,
+                    )
 
-        except Exception as exc:
-            log.error(str(exc), extra={
-                "event": "error",
-                "endpoint": "/job/ideas-bot",
-                "method": "JOB",
-                "status": 500,
-                "message": str(exc),
-                "error_type": type(exc).__name__,
-                "stack_trace": traceback.format_exc()[:2000],
-                "duration_ms": 0,
-            })
-            set_bot_status("failed", error=str(exc))
-            sys.exit(1)
+                # Guard: ensure agent actually made commits
+                ahead = capture_cmd(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo_dir)
+                if ahead == "0":
+                    raise RuntimeError(f"Agent made no commits in {repo_slug} — nothing to push")
+
+                # Push
+                run_cmd(
+                    ["git", "push", "origin", branch],
+                    cwd=repo_dir,
+                    extra_env={"GIT_TERMINAL_PROMPT": "0"},
+                )
+
+                # Open draft PR
+                pr_url = capture_cmd(
+                    [
+                        "gh", "pr", "create",
+                        "--draft",
+                        "--base", "main",
+                        "--head", branch,
+                        "--title", f"bot [{AZURE_OPENAI_DEPLOYMENT}]: {idea['title']}",
+                        "--body", build_pr_body(idea),
+                    ],
+                    cwd=repo_dir,
+                )
+                log.info(f"PR created: {pr_url}")
+                pr_urls.append(pr_url.strip())
+
+            except Exception as exc:
+                log.error(str(exc), extra={
+                    "event": "error",
+                    "endpoint": "/job/ideas-bot",
+                    "method": "JOB",
+                    "status": 500,
+                    "message": str(exc),
+                    "error_type": type(exc).__name__,
+                    "stack_trace": traceback.format_exc()[:2000],
+                    "duration_ms": 0,
+                })
+                set_bot_status("failed", error=str(exc))
+                sys.exit(1)
+
+    set_bot_status("completed", pr_url=pr_urls[0])
 
 
 if __name__ == "__main__":
