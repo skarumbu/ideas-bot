@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from datetime import date
 from pathlib import Path
@@ -253,44 +254,88 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
     return data.get("clear", True), data.get("question")
 
 
-# ── build verification ────────────────────────────────────────────────────────
-def verify_and_fix_build(idea: dict, repo_dir: str) -> None:
-    """Run the project build after agent commits. On failure, give the agent one repair round."""
-    if not (Path(repo_dir) / "package.json").exists():
-        return
+# ── CI watching + repair ───────────────────────────────────────────────────────
+CI_TIMEOUT_SECS = int(os.environ.get("BOT_CI_TIMEOUT_SECS", "600"))
 
-    log.info("Running build verification…")
+
+def _wait_for_checks(repo_slug: str, pr_number: str, repo_dir: str) -> tuple[bool, str]:
+    """Poll gh pr checks until all complete. Returns (all_passed, failure_log)."""
+    deadline = time.time() + CI_TIMEOUT_SECS
+    poll_secs = 30
+    while time.time() < deadline:
+        time.sleep(poll_secs)
+        result = subprocess.run(
+            ["gh", "pr", "checks", pr_number, "--repo", repo_slug,
+             "--json", "name,state,conclusion"],
+            cwd=repo_dir, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            log.warning(f"gh pr checks error: {result.stderr[:200]}")
+            continue
+
+        checks = json.loads(result.stdout or "[]")
+        if not checks:
+            continue
+
+        pending = [c for c in checks if c["state"] not in ("COMPLETED", "SUCCESS", "FAILURE", "ERROR", "CANCELLED", "SKIPPED", "TIMED_OUT")]
+        if pending:
+            log.info(f"CI: {len(pending)} check(s) still running…")
+            continue
+
+        failures = [c for c in checks if c.get("conclusion") not in ("SUCCESS", "SKIPPED", "NEUTRAL", None)]
+        if not failures:
+            log.info("CI: all checks passed")
+            return True, ""
+
+        log.warning(f"CI: {len(failures)} check(s) failed — fetching logs")
+        failure_log = _fetch_failure_logs(repo_slug, repo_dir)
+        return False, failure_log
+
+    return False, f"CI checks did not complete within {CI_TIMEOUT_SECS}s"
+
+
+def _fetch_failure_logs(repo_slug: str, repo_dir: str) -> str:
+    """Return failed-step logs from the most recent workflow run on the current branch."""
     result = subprocess.run(
-        ["npm", "run", "build", "--if-present"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env={**os.environ, "CI": "false"},
+        ["gh", "run", "list", "--repo", repo_slug, "--limit", "1",
+         "--json", "databaseId,conclusion"],
+        cwd=repo_dir, capture_output=True, text=True,
     )
-    if result.returncode == 0:
-        log.info("Build passed")
-        return
+    if result.returncode != 0 or not result.stdout.strip():
+        return "Could not retrieve CI run list"
+    runs = json.loads(result.stdout)
+    if not runs:
+        return "No CI runs found"
+    run_id = str(runs[0]["databaseId"])
+    log_result = subprocess.run(
+        ["gh", "run", "view", run_id, "--repo", repo_slug, "--log-failed"],
+        cwd=repo_dir, capture_output=True, text=True, timeout=60,
+    )
+    output = (log_result.stdout + log_result.stderr)
+    return output[-4000:] if output else "No log output retrieved"
 
-    build_output = (result.stdout + result.stderr)[-3000:]
-    log.warning(f"Build failed — attempting repair\n{build_output}")
 
-    # One targeted repair round
+def _repair_from_ci(repo_dir: str, failure_log: str) -> bool:
+    """Spawn a targeted repair agent using CI failure output. Returns True if commits were made."""
     repair_messages: list = [
         {
             "role": "system",
             "content": (
-                "You are an expert software engineer. The code you just committed has build errors. "
-                "Fix them using the provided tools. "
-                "When fixed, run: git add -A && git commit -m 'bot: fix build errors'"
+                "You are an expert software engineer. CI failed on your pull request. "
+                "Diagnose the failure from the logs, fix the code using the provided tools, "
+                "then commit: git add -A && git commit -m 'bot: fix CI failure'"
             ),
         },
         {
             "role": "user",
-            "content": f"Fix these build errors:\n\n```\n{build_output}\n```",
+            "content": f"CI failed with these logs:\n\n```\n{failure_log}\n```",
         },
     ]
-    for round_num in range(15):
+    commits_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True,
+    ).stdout.strip()
+
+    for round_num in range(20):
         log.info(f"Repair round {round_num + 1}")
         response = oai.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
@@ -302,30 +347,38 @@ def verify_and_fix_build(idea: dict, repo_dir: str) -> None:
         msg = response.choices[0].message
         repair_messages.append(msg)
         if not msg.tool_calls:
-            log.info(f"Repair agent finished: {msg.content[:200] if msg.content else '(no text)'}")
+            log.info(f"Repair agent done: {msg.content[:200] if msg.content else '(no text)'}")
             break
         for tc in msg.tool_calls:
             tool_result = dispatch_tool(tc, repo_dir)
-            repair_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": tool_result,
-            })
+            repair_messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
 
-    # Re-verify after repair
-    result2 = subprocess.run(
-        ["npm", "run", "build", "--if-present"],
+    commits_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True,
+    ).stdout.strip()
+    return commits_after != commits_before
+
+
+def watch_ci_and_repair(repo_slug: str, pr_number: str, repo_dir: str, branch: str) -> None:
+    """Watch GitHub Actions on the PR. On failure: repair, push, watch once more."""
+    passed, failure_log = _wait_for_checks(repo_slug, pr_number, repo_dir)
+    if passed:
+        return
+
+    log.warning("CI failed — running repair agent")
+    made_commits = _repair_from_ci(repo_dir, failure_log)
+    if not made_commits:
+        raise RuntimeError(f"CI failed and repair agent made no commits.\n{failure_log[-1000:]}")
+
+    run_cmd(
+        ["git", "push", "origin", branch],
         cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env={**os.environ, "CI": "false"},
+        extra_env={"GIT_TERMINAL_PROMPT": "0"},
     )
-    if result2.returncode != 0:
-        raise RuntimeError(
-            f"Build still failing after repair attempt:\n{(result2.stdout + result2.stderr)[-2000:]}"
-        )
-    log.info("Build passed after repair")
+    log.info("Repair pushed — waiting for CI again")
+    passed2, failure_log2 = _wait_for_checks(repo_slug, pr_number, repo_dir)
+    if not passed2:
+        raise RuntimeError(f"CI still failing after repair.\n{failure_log2[-1000:]}")
 
 
 # ── agent loop ─────────────────────────────────────────────────────────────────
@@ -492,9 +545,6 @@ def main() -> None:
                         cwd=repo_dir,
                     )
 
-                # Build verification — catches missing deps and type errors before push
-                verify_and_fix_build(idea, repo_dir)
-
                 # Guard: ensure agent actually made commits
                 ahead = capture_cmd(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo_dir)
                 if ahead == "0":
@@ -519,8 +569,14 @@ def main() -> None:
                     ],
                     cwd=repo_dir,
                 )
+                pr_url = pr_url.strip()
                 log.info(f"PR created: {pr_url}")
-                pr_urls.append(pr_url.strip())
+
+                # Watch GitHub Actions — repair and re-push on failure
+                pr_number = pr_url.rstrip("/").split("/")[-1]
+                watch_ci_and_repair(repo_slug, pr_number, repo_dir, branch)
+
+                pr_urls.append(pr_url)
 
             except Exception as exc:
                 log.error(str(exc), extra={
