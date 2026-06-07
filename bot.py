@@ -267,7 +267,7 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
         f"{idea.get('body', '')}"
     )
     if prior_updates:
-        thread = "\n".join(f"[{u['author']}]: {u['body']}" for u in prior_updates)
+        thread = "\n".join(f"[{u.get('author_name') or u.get('author_email', 'unknown')}]: {u['content']}" for u in prior_updates)
         user_msg += f"\n\n## Prior conversation\n{thread}\n\nUse the user's answers above to guide your implementation."
     messages: list = [
         {"role": "system", "content": system},
