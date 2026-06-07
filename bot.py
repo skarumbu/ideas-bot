@@ -27,7 +27,7 @@ IDEAS_API_URL         = os.environ["IDEAS_API_URL"].rstrip("/")
 IDEAS_WRITE_KEY       = os.environ["IDEAS_WRITE_KEY"]
 AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZURE_OPENAI_API_KEY  = os.environ["AZURE_OPENAI_API_KEY"]
-AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "o3-mini")
 GITHUB_PAT            = os.environ["GITHUB_PAT"]
 GITHUB_USERNAME       = os.environ.get("GITHUB_USERNAME", "skarumbu")
 
@@ -96,6 +96,25 @@ TOOLS = [
 # ── ideas-api helpers ──────────────────────────────────────────────────────────
 def _machine_headers() -> dict:
     return {"Content-Type": "application/json", "X-Ideas-Key": IDEAS_WRITE_KEY}
+
+
+def fetch_updates(idea_id: str) -> list[dict]:
+    resp = requests.get(
+        f"{IDEAS_API_URL}/api/ideas/{idea_id}/updates",
+        headers=_machine_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("updates", [])
+
+
+def post_bot_update(idea_id: str, text: str) -> None:
+    requests.post(
+        f"{IDEAS_API_URL}/api/ideas/{idea_id}/updates",
+        json={"body": text, "author": "bot"},
+        headers=_machine_headers(),
+        timeout=15,
+    ).raise_for_status()
 
 
 def set_bot_status(status: str, pr_url: str | None = None, error: str | None = None) -> None:
@@ -198,8 +217,38 @@ def dispatch_tool(tool_call, repo_dir: str) -> str:
         return f"Error: {exc}"
 
 
-# ── GPT-4o agent loop ──────────────────────────────────────────────────────────
-def run_agent(idea: dict, repo_dir: str) -> None:
+# ── pre-flight clarity check ───────────────────────────────────────────────────
+def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
+    response = oai.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": "You assess software feature ideas for autonomous implementation clarity.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Can this feature idea be implemented autonomously without clarification?\n\n"
+                    f"Title: {idea['title']}\n"
+                    f"Project: {idea.get('project', '')}\n"
+                    f"Description: {idea.get('body', '') or '(none)'}\n\n"
+                    f"Reply with JSON only: {{\"clear\": true}} if implementable as-is, "
+                    f"or {{\"clear\": false, \"question\": \"your specific question\"}} if not. "
+                    f"Be permissive — only flag when truly ambiguous."
+                ),
+            },
+        ],
+        max_tokens=256,
+    )
+    text = response.choices[0].message.content.strip()
+    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
+    data = json.loads(text)
+    return data.get("clear", True), data.get("question")
+
+
+# ── agent loop ─────────────────────────────────────────────────────────────────
+def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
     system = (
         "You are an expert software engineer implementing a feature from a backlog idea.\n"
         "Use the provided tools to explore the repo structure, understand the codebase, "
@@ -217,6 +266,9 @@ def run_agent(idea: dict, repo_dir: str) -> None:
         f"Title: {idea['title']}\n\n"
         f"{idea.get('body', '')}"
     )
+    if prior_updates:
+        thread = "\n".join(f"[{u['author']}]: {u['body']}" for u in prior_updates)
+        user_msg += f"\n\n## Prior conversation\n{thread}\n\nUse the user's answers above to guide your implementation."
     messages: list = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
@@ -229,7 +281,7 @@ def run_agent(idea: dict, repo_dir: str) -> None:
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            max_tokens=4096,
+            max_tokens=8096,
         )
         msg = response.choices[0].message
         messages.append(msg)
@@ -297,10 +349,26 @@ def main() -> None:
 
     set_bot_status("running")
 
+    try:
+        is_clear, question = assess_idea_clarity(idea)
+    except Exception as exc:
+        log.warning(f"Clarity check failed ({exc}), proceeding anyway")
+        is_clear, question = True, None
+
+    if not is_clear and question:
+        post_bot_update(
+            IDEA_ID,
+            f"I need more information before I can implement this:\n\n{question}\n\nPlease reply and re-trigger the bot.",
+        )
+        set_bot_status("needs_info")
+        log.info("Idea needs clarification — bot pausing")
+        sys.exit(0)
+
     with tempfile.TemporaryDirectory(prefix="ideas-bot-") as work_dir:
         repo_dir = str(Path(work_dir) / "repo")
         safe_title = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower())[:40].strip("-")
-        branch = f"bot/{date.today().isoformat()}-{safe_title}"
+        model_slug = re.sub(r"[^a-z0-9]+", "-", AZURE_OPENAI_DEPLOYMENT.lower())
+        branch = f"bot/{date.today().isoformat()}-{model_slug}-{safe_title}"
 
         try:
             # Clone
@@ -320,9 +388,10 @@ def main() -> None:
             # Feature branch
             run_cmd(["git", "checkout", "-b", branch], cwd=repo_dir)
 
-            # Run GPT-4o agent
-            log.info("Running GPT-4o agent…")
-            run_agent(idea, repo_dir)
+            # Run agent
+            log.info(f"Running agent ({AZURE_OPENAI_DEPLOYMENT})…")
+            prior_updates = fetch_updates(IDEA_ID)
+            run_agent(idea, repo_dir, prior_updates)
 
             # Catch any uncommitted stragglers
             uncommitted = capture_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
@@ -352,7 +421,7 @@ def main() -> None:
                     "--draft",
                     "--base", "main",
                     "--head", branch,
-                    "--title", f"bot: {idea['title']}",
+                    "--title", f"bot [{AZURE_OPENAI_DEPLOYMENT}]: {idea['title']}",
                     "--body", build_pr_body(idea),
                 ],
                 cwd=repo_dir,
