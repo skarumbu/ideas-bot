@@ -364,10 +364,19 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
 
 
 # ── idea decomposition ────────────────────────────────────────────────────────
-def decompose_idea(idea: dict, repo: str) -> list[dict] | None:
-    """Returns [{title, body},...] if the idea should be split, or None if simple."""
+def decompose_idea(idea: dict, repo: str, all_projects: list[dict] | None = None) -> list[dict] | None:
+    """
+    Returns [{title, body, project_name},...] if the idea should be split, or None if simple.
+    Each subtask carries a project_name so it is filed under the right repo.
+    """
     if (idea.get("source") or "").startswith("bot:subtask:"):
         return None  # never decompose a child task
+
+    proj_lines = "\n".join(
+        f"  - \"{p['name']}\" → repo: {p.get('repo') or 'none'}"
+        for p in (all_projects or [])
+    )
+    projects_block = f"\nAvailable projects:\n{proj_lines}\n" if proj_lines else ""
 
     response = _chat_complete(
         model=AZURE_OPENAI_DEPLOYMENT,
@@ -385,24 +394,29 @@ def decompose_idea(idea: dict, repo: str) -> list[dict] | None:
                 "content": (
                     f"Feature idea:\n"
                     f"Title: {idea['title']}\n"
-                    f"Project: {idea.get('project', '')}\n"
-                    f"Repo: {repo}\n"
-                    f"Description: {idea.get('body', '') or '(none)'}\n\n"
+                    f"Current project: \"{idea.get('project', '')}\" (repo: {repo})\n"
+                    f"Description: {idea.get('body', '') or '(none)'}\n"
+                    f"{projects_block}\n"
                     "Keep as ONE task if: small UI change, single endpoint, minor refactor, "
-                    "or a focused change in one area.\n"
-                    "SPLIT into 2–4 tasks if: the idea mixes unrelated subsystems "
-                    "(e.g. DB schema + API + UI), or would require 5+ unrelated commits, "
-                    "or involves both backend and frontend changes.\n\n"
-                    "Each sub-task title must be specific and self-contained. "
-                    f"Each sub-task body must include what to implement and end with: "
+                    "or a focused change in one area of one repo.\n"
+                    "SPLIT into 2–4 tasks if: the idea touches multiple repos, or mixes "
+                    "unrelated subsystems (e.g. backend API + frontend UI), or would require "
+                    "5+ unrelated commits.\n\n"
+                    "Rules for each sub-task:\n"
+                    "- Must target exactly ONE repo — no mixed-repo sub-tasks\n"
+                    "- Set project_name to the EXACT project name from the available projects "
+                    "list whose repo contains the work for that sub-task\n"
+                    "- Title must be specific and self-contained\n"
+                    f"- Body must describe what to implement and end with: "
                     f"'Part of: {idea['title']} (idea #{IDEA_ID})'\n\n"
                     "Reply with JSON only:\n"
-                    '{"decompose": false} OR '
-                    '{"decompose": true, "subtasks": [{"title": "...", "body": "..."}]}'
+                    '{"decompose": false} OR\n'
+                    '{"decompose": true, "subtasks": ['
+                    '{"title": "...", "body": "...", "project_name": "<exact project name>"}]}'
                 ),
             },
         ],
-        max_tokens=800,
+        max_tokens=1000,
     )
     text = response.choices[0].message.content.strip()
     text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
@@ -410,7 +424,21 @@ def decompose_idea(idea: dict, repo: str) -> list[dict] | None:
     if not data.get("decompose"):
         return None
     subtasks = data.get("subtasks") or []
-    return subtasks if subtasks else None
+    if not subtasks:
+        return None
+
+    # Validate project_name fields — fall back to parent's project if unrecognised
+    valid_names = {p["name"] for p in (all_projects or [])}
+    for st in subtasks:
+        assigned = st.get("project_name", "")
+        if assigned not in valid_names:
+            log.warning(
+                f"Decompose assigned unknown project '{assigned}' to subtask '{st.get('title')}' "
+                f"— falling back to parent project '{idea.get('project', '')}'"
+            )
+            st["project_name"] = idea.get("project", "")
+
+    return subtasks
 
 
 # ── CI watching + repair ───────────────────────────────────────────────────────
@@ -722,21 +750,26 @@ def main() -> None:
     is_subtask = (idea.get("source") or "").startswith("bot:subtask:")
     if not is_subtask:
         try:
-            subtasks = decompose_idea(idea, repo)
+            subtasks = decompose_idea(idea, repo, all_projects=all_projects)
         except Exception as exc:
             log.warning(f"Decompose check failed ({exc}), proceeding as single task")
             subtasks = None
 
         if subtasks:
-            this_project = next((p for p in all_projects if p["name"] == project_name), None)
             child_ideas = []
             for st in subtasks:
+                st_project_name = st.get("project_name") or project_name
+                st_project = next((p for p in all_projects if p["name"] == st_project_name), None)
+                if not st_project:
+                    st_project_name = project_name
+                    st_project = next((p for p in all_projects if p["name"] == project_name), None)
+                log.info(f"Creating subtask '{st['title']}' in project '{st_project_name}'")
                 resp = requests.post(
                     f"{IDEAS_API_URL}/api/ideas",
                     headers=_machine_headers(),
                     json={
-                        "project": project_name,
-                        "project_id": this_project["id"] if this_project else idea.get("project_id"),
+                        "project": st_project_name,
+                        "project_id": st_project["id"] if st_project else idea.get("project_id"),
                         "title": st["title"],
                         "body": st["body"],
                         "source": f"bot:subtask:{IDEA_ID}",
@@ -747,7 +780,7 @@ def main() -> None:
                     new_idea = resp.json()
                     child_ideas.append({
                         "id": new_idea["id"],
-                        "project": project_name,
+                        "project": st_project_name,
                         "title": st["title"],
                         "type": "subtask",
                     })
