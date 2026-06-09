@@ -51,7 +51,7 @@ def _chat_complete(**kwargs):
         except openai.RateLimitError as exc:
             if attempt == 3:
                 raise
-            wait = 60 * (attempt + 1)
+            wait = [60, 120, 300][attempt]
             log.warning(f"Rate limited (attempt {attempt + 1}/4) — sleeping {wait}s: {exc}")
             time.sleep(wait)
 
@@ -262,14 +262,14 @@ def dispatch_tool(tool_call, repo_dir: str, all_projects: list[dict] | None = No
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
             output = result.stdout + result.stderr
-            return output[:8000] if output else "(no output)"
+            return output[:2500] if output else "(no output)"
 
         elif name == "read_file":
             path = Path(repo_dir) / args["path"]
             if not path.exists():
                 return f"Error: file not found: {args['path']}"
             content = path.read_text(errors="replace")
-            return content[:8000] if len(content) > 8000 else content
+            return content[:4000] if len(content) > 4000 else content
 
         elif name == "write_file":
             path = Path(repo_dir) / args["path"]
@@ -501,7 +501,7 @@ def _repair_from_ci(repo_dir: str, failure_log: str) -> bool:
             messages=repair_messages,
             tools=TOOLS,
             tool_choice="auto",
-            max_tokens=8096,
+            max_tokens=4096,
         )
         msg = response.choices[0].message
         repair_messages.append(msg)
@@ -578,13 +578,13 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         log.info(f"Agent round {round_num + 1}")
         # Keep system + user prompt + last N exchanges to bound context size.
         # Tool results can be large; trimming older ones reduces 429 risk.
-        context = messages[:2] + messages[2:][-30:] if len(messages) > 32 else messages
+        context = messages[:2] + messages[2:][-14:] if len(messages) > 16 else messages
         response = _chat_complete(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=context,
             tools=TOOLS,
             tool_choice="auto",
-            max_tokens=8096,
+            max_tokens=4096,
         )
         msg = response.choices[0].message
         messages.append(msg)
