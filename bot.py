@@ -16,6 +16,7 @@ import traceback
 from datetime import date
 from pathlib import Path
 
+import openai
 import requests
 from openai import AzureOpenAI
 from shared_logging import get_logger
@@ -41,6 +42,19 @@ oai = AzureOpenAI(
     max_retries=8,       # retry up to 8x with exponential backoff on 429/5xx
     timeout=120.0,       # per-request timeout in seconds
 )
+
+def _chat_complete(**kwargs):
+    """Wrapper around oai.chat.completions.create with app-level 429 retry."""
+    for attempt in range(4):
+        try:
+            return oai.chat.completions.create(**kwargs)  # noqa: direct call inside wrapper
+        except openai.RateLimitError as exc:
+            if attempt == 3:
+                raise
+            wait = 60 * (attempt + 1)
+            log.warning(f"Rate limited (attempt {attempt + 1}/4) — sleeping {wait}s: {exc}")
+            time.sleep(wait)
+
 
 TOOLS = [
     {
@@ -306,7 +320,7 @@ def dispatch_tool(tool_call, repo_dir: str, all_projects: list[dict] | None = No
 
 # ── pre-flight clarity check ───────────────────────────────────────────────────
 def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
-    response = oai.chat.completions.create(
+    response = _chat_complete(
         model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
             {
@@ -432,7 +446,7 @@ def _repair_from_ci(repo_dir: str, failure_log: str) -> bool:
 
     for round_num in range(20):
         log.info(f"Repair round {round_num + 1}")
-        response = oai.chat.completions.create(
+        response = _chat_complete(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=repair_messages,
             tools=TOOLS,
@@ -515,7 +529,7 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         # Keep system + user prompt + last N exchanges to bound context size.
         # Tool results can be large; trimming older ones reduces 429 risk.
         context = messages[:2] + messages[2:][-30:] if len(messages) > 32 else messages
-        response = oai.chat.completions.create(
+        response = _chat_complete(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=context,
             tools=TOOLS,
