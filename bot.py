@@ -86,6 +86,14 @@ TOOLS = [
 ]
 
 
+# ── clean exit with log-flush delay ───────────────────────────────────────────
+def _exit(code: int, delay: int = 12) -> None:
+    """Sleep before exit so Azure Container Apps log-shipping has time to complete."""
+    if code != 0:
+        time.sleep(delay)
+    sys.exit(code)
+
+
 # ── ideas-api helpers ──────────────────────────────────────────────────────────
 def _machine_headers() -> dict:
     return {"Content-Type": "application/json", "X-Ideas-Key": IDEAS_WRITE_KEY}
@@ -231,22 +239,37 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
         messages=[
             {
                 "role": "system",
-                "content": "You assess software feature ideas for autonomous implementation clarity.",
+                "content": (
+                    "You assess software feature ideas for autonomous implementation clarity. "
+                    "The project is a personal web app (React + TypeScript frontend, Python Azure "
+                    "Functions backend). Be permissive — most UI tweaks, new pages, and small "
+                    "features have an obvious implementation. Only ask when the answer would "
+                    "meaningfully fork the code path (e.g. which data to fetch, what the primary "
+                    "action is, whether backend changes are needed)."
+                ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Can this feature idea be implemented autonomously without clarification?\n\n"
+                    f"Feature idea:\n"
                     f"Title: {idea['title']}\n"
                     f"Project: {idea.get('project', '')}\n"
                     f"Description: {idea.get('body', '') or '(none)'}\n\n"
-                    f"Reply with JSON only: {{\"clear\": true}} if implementable as-is, "
-                    f"or {{\"clear\": false, \"question\": \"your specific question\"}} if not. "
-                    f"Be permissive — only flag when truly ambiguous."
+                    f"Is this implementable without clarification?\n\n"
+                    f"Rules:\n"
+                    f"- Return clear=true if a skilled developer could make a reasonable "
+                    f"implementation decision on their own\n"
+                    f"- Only return clear=false when missing info would cause significantly "
+                    f"different code — e.g. unknown data source, ambiguous primary action, "
+                    f"unclear scope (1 page vs 5 pages)\n"
+                    f"- Do NOT ask about style, color, copy, or other preferences with obvious defaults\n"
+                    f"- If asking, make the question concrete and answerable in 1-2 sentences\n\n"
+                    f"Reply with JSON only:\n"
+                    f"{{\"clear\": true}} OR {{\"clear\": false, \"question\": \"<specific question>\"}}"
                 ),
             },
         ],
-        max_tokens=256,
+        max_tokens=300,
     )
     text = response.choices[0].message.content.strip()
     text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
@@ -475,7 +498,7 @@ def main() -> None:
             "duration_ms": 0,
         })
         set_bot_status("failed", error=f"Could not fetch idea: {exc}")
-        sys.exit(1)
+        _exit(1)
 
     log.info(f"Idea: {idea['title']} (project: {idea.get('project') or idea.get('feature_name', '')})")
 
@@ -484,7 +507,7 @@ def main() -> None:
     if not repos:
         set_bot_status("failed", error=f"Project '{project_name}' has no repos configured. Add repos in the Ideas app.")
         log.error(f"No repos configured for project '{project_name}'")
-        sys.exit(1)
+        _exit(1)
     log.info(f"Target repos: {repos}")
 
     set_bot_status("running")
@@ -502,7 +525,7 @@ def main() -> None:
         )
         set_bot_status("needs_info")
         log.info("Idea needs clarification — bot pausing")
-        sys.exit(0)
+        _exit(0)
 
     safe_title = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower())[:40].strip("-")
     model_slug = re.sub(r"[^a-z0-9]+", "-", AZURE_OPENAI_DEPLOYMENT.lower())
@@ -590,7 +613,7 @@ def main() -> None:
                     "duration_ms": 0,
                 })
                 set_bot_status("failed", error=str(exc))
-                sys.exit(1)
+                _exit(1)
 
     set_bot_status("completed", pr_url=pr_urls[0])
 
