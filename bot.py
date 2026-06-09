@@ -363,6 +363,56 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
     return data.get("clear", True), data.get("question")
 
 
+# ── idea decomposition ────────────────────────────────────────────────────────
+def decompose_idea(idea: dict, repo: str) -> list[dict] | None:
+    """Returns [{title, body},...] if the idea should be split, or None if simple."""
+    if (idea.get("source") or "").startswith("bot:subtask:"):
+        return None  # never decompose a child task
+
+    response = _chat_complete(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior software engineer planning implementation work. "
+                    "Decide whether a feature idea should be implemented in one focused session "
+                    "or broken into 2–4 sequential sub-tasks. Only split when genuinely necessary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Feature idea:\n"
+                    f"Title: {idea['title']}\n"
+                    f"Project: {idea.get('project', '')}\n"
+                    f"Repo: {repo}\n"
+                    f"Description: {idea.get('body', '') or '(none)'}\n\n"
+                    "Keep as ONE task if: small UI change, single endpoint, minor refactor, "
+                    "or a focused change in one area.\n"
+                    "SPLIT into 2–4 tasks if: the idea mixes unrelated subsystems "
+                    "(e.g. DB schema + API + UI), or would require 5+ unrelated commits, "
+                    "or involves both backend and frontend changes.\n\n"
+                    "Each sub-task title must be specific and self-contained. "
+                    f"Each sub-task body must include what to implement and end with: "
+                    f"'Part of: {idea['title']} (idea #{IDEA_ID})'\n\n"
+                    "Reply with JSON only:\n"
+                    '{"decompose": false} OR '
+                    '{"decompose": true, "subtasks": [{"title": "...", "body": "..."}]}'
+                ),
+            },
+        ],
+        max_tokens=800,
+    )
+    text = response.choices[0].message.content.strip()
+    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
+    data = json.loads(text)
+    if not data.get("decompose"):
+        return None
+    subtasks = data.get("subtasks") or []
+    return subtasks if subtasks else None
+
+
 # ── CI watching + repair ───────────────────────────────────────────────────────
 CI_TIMEOUT_SECS = int(os.environ.get("BOT_CI_TIMEOUT_SECS", "600"))
 
@@ -634,7 +684,19 @@ def main() -> None:
                 _exit(0)
             else:
                 log.info("All dependencies completed — clearing block and proceeding")
-                set_bot_status("running", bot_blocked_by="")
+                all_were_subtasks = all(b.get("type") == "subtask" for b in blocking)
+                if all_were_subtasks:
+                    child_refs = ", ".join(f"{b['title']} (#{b['id'][:8]})" for b in blocking)
+                    set_bot_status(
+                        "completed",
+                        bot_blocked_by="",
+                        error=f"Completed via {len(blocking)} sub-task(s): {child_refs}",
+                    )
+                    log.info("All sub-tasks done — parent marked complete")
+                    _exit(0)
+                else:
+                    # Cross-repo deps: clear block and proceed to agent loop
+                    set_bot_status("running", bot_blocked_by="")
 
     created_ideas: list[dict] = []
 
@@ -655,6 +717,55 @@ def main() -> None:
         set_bot_status("needs_info")
         log.info("Idea needs clarification — bot pausing")
         _exit(0)
+
+    # Decompose complex ideas into focused sub-tasks to avoid rate limits
+    is_subtask = (idea.get("source") or "").startswith("bot:subtask:")
+    if not is_subtask:
+        try:
+            subtasks = decompose_idea(idea, repo)
+        except Exception as exc:
+            log.warning(f"Decompose check failed ({exc}), proceeding as single task")
+            subtasks = None
+
+        if subtasks:
+            this_project = next((p for p in all_projects if p["name"] == project_name), None)
+            child_ideas = []
+            for st in subtasks:
+                resp = requests.post(
+                    f"{IDEAS_API_URL}/api/ideas",
+                    headers=_machine_headers(),
+                    json={
+                        "project": project_name,
+                        "project_id": this_project["id"] if this_project else idea.get("project_id"),
+                        "title": st["title"],
+                        "body": st["body"],
+                        "source": f"bot:subtask:{IDEA_ID}",
+                    },
+                    timeout=15,
+                )
+                if resp.status_code == 201:
+                    new_idea = resp.json()
+                    child_ideas.append({
+                        "id": new_idea["id"],
+                        "project": project_name,
+                        "title": st["title"],
+                        "type": "subtask",
+                    })
+
+            if child_ideas:
+                lines = "\n".join(f"  {i+1}. {c['title']} (ID: {c['id']})" for i, c in enumerate(child_ideas))
+                post_bot_update(
+                    IDEA_ID,
+                    f"Decomposed into {len(child_ideas)} sub-tasks to reduce API load:\n{lines}\n\n"
+                    "Each will run as a separate bot job. Re-trigger this idea once all are completed.",
+                )
+                set_bot_status(
+                    "blocked",
+                    error=f"Waiting for {len(child_ideas)} sub-task(s) to complete",
+                    bot_blocked_by=json.dumps(child_ideas),
+                )
+                log.info(f"Decomposed into {len(child_ideas)} sub-tasks")
+                _exit(0)
 
     safe_title = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower())[:40].strip("-")
     model_slug = re.sub(r"[^a-z0-9]+", "-", AZURE_OPENAI_DEPLOYMENT.lower())
