@@ -38,6 +38,8 @@ oai = AzureOpenAI(
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
     api_key=AZURE_OPENAI_API_KEY,
     api_version="2024-12-01-preview",
+    max_retries=8,       # retry up to 8x with exponential backoff on 429/5xx
+    timeout=120.0,       # per-request timeout in seconds
 )
 
 TOOLS = [
@@ -435,9 +437,12 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
 
     for round_num in range(40):
         log.info(f"Agent round {round_num + 1}")
+        # Keep system + user prompt + last N exchanges to bound context size.
+        # Tool results can be large; trimming older ones reduces 429 risk.
+        context = messages[:2] + messages[2:][-30:] if len(messages) > 32 else messages
         response = oai.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
-            messages=messages,
+            messages=context,
             tools=TOOLS,
             tool_choice="auto",
             max_tokens=8096,
