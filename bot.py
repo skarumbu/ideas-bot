@@ -85,6 +85,33 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_idea",
+            "description": (
+                "Use this when you discover work that must happen in a different repository. "
+                "Do NOT clone or modify that repo — call this tool to file a dependency idea. "
+                "Provide enough context in 'body' that the next bot can act without referring back. "
+                "The current idea will be marked as blocked until the dependency is completed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {
+                        "type": "string",
+                        "description": "Exact project name from the available projects list.",
+                    },
+                    "title": {"type": "string"},
+                    "body": {
+                        "type": "string",
+                        "description": "What to change, why it is needed, and a reference to this idea.",
+                    },
+                },
+                "required": ["project_name", "title", "body"],
+            },
+        },
+    },
 ]
 
 
@@ -120,12 +147,14 @@ def post_bot_update(idea_id: str, text: str) -> None:
     ).raise_for_status()
 
 
-def set_bot_status(status: str, pr_url: str | None = None, error: str | None = None) -> None:
+def set_bot_status(status: str, pr_url: str | None = None, error: str | None = None, bot_blocked_by: str | None = None) -> None:
     payload: dict = {"bot_status": status}
     if pr_url is not None:
         payload["bot_pr_url"] = pr_url
     if error is not None:
         payload["bot_error"] = error[:500]
+    if bot_blocked_by is not None:
+        payload["bot_blocked_by"] = bot_blocked_by
     try:
         resp = requests.patch(
             f"{IDEAS_API_URL}/api/ideas/{IDEA_ID}/bot",
@@ -160,6 +189,16 @@ def fetch_project_repo(project_name: str) -> str:
     return ""
 
 
+def fetch_all_projects() -> list[dict]:
+    resp = requests.get(
+        f"{IDEAS_API_URL}/api/projects",
+        headers=_machine_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("projects", [])
+
+
 def fetch_idea() -> dict:
     resp = requests.get(
         f"{IDEAS_API_URL}/api/ideas",
@@ -190,7 +229,7 @@ def capture_cmd(args: list[str], cwd: str) -> str:
 
 
 # ── agent tool dispatch ────────────────────────────────────────────────────────
-def dispatch_tool(tool_call, repo_dir: str) -> str:
+def dispatch_tool(tool_call, repo_dir: str, all_projects: list[dict] | None = None, created_ideas: list[dict] | None = None) -> str:
     name = tool_call.function.name
     try:
         args = json.loads(tool_call.function.arguments)
@@ -224,6 +263,37 @@ def dispatch_tool(tool_call, repo_dir: str) -> str:
             content = args["content"].replace('\x00', '')
             path.write_text(content)
             return f"Written {len(content)} chars to {args['path']}"
+
+        elif name == "create_idea":
+            proj_name = args.get("project_name", "")
+            title = args.get("title", "")
+            body = args.get("body", "")
+            projects = all_projects or []
+            target = next((p for p in projects if p["name"] == proj_name), None)
+            if not target:
+                available = [p["name"] for p in projects]
+                return f"Error: project '{proj_name}' not found. Available: {available}. Retry with an exact name."
+            resp = requests.post(
+                f"{IDEAS_API_URL}/api/ideas",
+                headers=_machine_headers(),
+                json={
+                    "project": proj_name,
+                    "project_id": target["id"],
+                    "title": title,
+                    "body": body,
+                    "source": f"bot:cross-repo:{IDEA_ID}",
+                },
+                timeout=15,
+            )
+            if resp.status_code == 201:
+                new_idea = resp.json()
+                if created_ideas is not None:
+                    created_ideas.append({"id": new_idea["id"], "project": proj_name, "title": title})
+                return (
+                    f"Dependency idea created (ID: {new_idea['id']}) in project '{proj_name}'. "
+                    "The current idea will be blocked until this dependency is completed."
+                )
+            return f"Error creating idea: HTTP {resp.status_code} — {resp.text[:200]}"
 
         else:
             return f"Error: unknown tool '{name}'"
@@ -407,7 +477,7 @@ def watch_ci_and_repair(repo_slug: str, pr_number: str, repo_dir: str, branch: s
 
 
 # ── agent loop ─────────────────────────────────────────────────────────────────
-def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
+def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects: list[dict] | None = None, created_ideas: list[dict] | None = None) -> None:
     system = (
         "You are an expert software engineer implementing a feature from a backlog idea.\n"
         "Use the provided tools to explore the repo structure, understand the codebase, "
@@ -420,7 +490,9 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
         "already listed; if not, run: npm install <package> --save (or --save-dev for types)\n"
         "- When done, commit: git add -A && git commit -m 'bot: <concise summary>'\n"
         "- Do NOT push — the orchestrator handles that\n"
-        "- After committing, stop calling tools and give a short plain-text summary"
+        "- After committing, stop calling tools and give a short plain-text summary\n"
+        "- If completing this idea requires work in a different repository, call create_idea to "
+        "file that work as a dependency — do not clone or modify other repos yourself"
     )
     user_msg = (
         f"Project: {idea.get('project') or idea.get('feature_name', '')}\n"
@@ -430,6 +502,9 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
     if prior_updates:
         thread = "\n".join(f"[{u.get('author_name') or u.get('author_email', 'unknown')}]: {u['content']}" for u in prior_updates)
         user_msg += f"\n\n## Prior conversation\n{thread}\n\nUse the user's answers above to guide your implementation."
+    if all_projects:
+        proj_list = "\n".join(f"  - {p['name']} (repo: {p.get('repo') or 'none'})" for p in all_projects)
+        user_msg += f"\n\n## Available projects for cross-repo dependencies\n{proj_list}"
     messages: list = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
@@ -456,7 +531,7 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict]) -> None:
 
         for tc in msg.tool_calls:
             log.info(f"  tool: {tc.function.name}({tc.function.arguments[:120]})")
-            result = dispatch_tool(tc, repo_dir)
+            result = dispatch_tool(tc, repo_dir, all_projects=all_projects, created_ideas=created_ideas)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -515,7 +590,42 @@ def main() -> None:
         _exit(1)
     log.info(f"Target repo: {repo}")
 
-    set_bot_status("running")
+    try:
+        all_projects = fetch_all_projects()
+    except Exception as exc:
+        log.warning(f"Could not fetch all projects ({exc}), cross-repo tool will be unavailable")
+        all_projects = []
+
+    # If previously blocked, check whether all dependencies are now complete
+    blocked_by_raw = idea.get("bot_blocked_by") or ""
+    if blocked_by_raw:
+        try:
+            blocking = json.loads(blocked_by_raw)
+        except Exception:
+            blocking = []
+        if blocking:
+            try:
+                all_ideas_resp = requests.get(f"{IDEAS_API_URL}/api/ideas", headers=_machine_headers(), timeout=15)
+                all_ideas_resp.raise_for_status()
+                all_ideas_map = {i["id"]: i for i in all_ideas_resp.json().get("ideas", [])}
+            except Exception as exc:
+                log.error(f"Could not fetch ideas for dependency check: {exc}")
+                set_bot_status("blocked", error="Could not verify dependencies", bot_blocked_by=blocked_by_raw)
+                _exit(0)
+            still_blocking = [b for b in blocking if all_ideas_map.get(b["id"], {}).get("bot_status") != "completed"]
+            if still_blocking:
+                names = ", ".join(f"[{b['project']}] {b['title']}" for b in still_blocking)
+                log.info(f"Still blocked by: {names}")
+                set_bot_status("blocked", error=f"Waiting on: {names}", bot_blocked_by=json.dumps(still_blocking))
+                _exit(0)
+            else:
+                log.info("All dependencies completed — clearing block and proceeding")
+                set_bot_status("running", bot_blocked_by="")
+
+    created_ideas: list[dict] = []
+
+    if not blocked_by_raw:
+        set_bot_status("running")
 
     try:
         is_clear, question = assess_idea_clarity(idea)
@@ -555,7 +665,15 @@ def main() -> None:
             run_cmd(["git", "checkout", "-b", branch], cwd=repo_dir)
 
             log.info(f"Running agent ({AZURE_OPENAI_DEPLOYMENT}) on {repo}…")
-            run_agent(idea, repo_dir, prior_updates)
+            run_agent(idea, repo_dir, prior_updates, all_projects=all_projects, created_ideas=created_ideas)
+
+            # If the agent created cross-repo dependencies, block and don't push
+            if created_ideas:
+                dep_lines = "\n".join(f"  - [{d['project']}] {d['title']} (ID: {d['id']})" for d in created_ideas)
+                post_bot_update(IDEA_ID, f"Blocked — created the following dependency ideas:\n{dep_lines}\n\nRe-trigger once these are completed.")
+                set_bot_status("blocked", error=f"Waiting on {len(created_ideas)} dependency idea(s)", bot_blocked_by=json.dumps(created_ideas))
+                log.info(f"Blocked on {len(created_ideas)} dependency idea(s)")
+                _exit(0)
 
             uncommitted = capture_cmd(["git", "status", "--porcelain"], cwd=repo_dir)
             if uncommitted:
