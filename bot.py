@@ -31,6 +31,7 @@ AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZURE_OPENAI_API_KEY  = os.environ["AZURE_OPENAI_API_KEY"]
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "o3-mini")
 GITHUB_PAT            = os.environ["GITHUB_PAT"]
+AZURE_TABLES_CONNECTION_STRING = os.environ.get("AZURE_TABLES_CONNECTION_STRING", "")
 GITHUB_USERNAME       = os.environ.get("GITHUB_USERNAME", "skarumbu")
 
 
@@ -123,6 +124,35 @@ TOOLS = [
                     },
                 },
                 "required": ["project_name", "title", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_table",
+            "description": (
+                "Query Azure Table Storage to inspect live data — use to understand "
+                "actual record shapes, find existing entries, and validate assumptions "
+                "before writing code. Read-only. Available tables: ideas, projects, updates."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "type": "string",
+                        "description": "Table name (e.g. 'ideas', 'projects', 'updates')",
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "OData filter expression (optional). E.g. \"PartitionKey eq 'ideas'\"",
+                    },
+                    "top": {
+                        "type": "integer",
+                        "description": "Max records to return (1–20, default 5)",
+                    },
+                },
+                "required": ["table_name"],
             },
         },
     },
@@ -329,6 +359,18 @@ def dispatch_tool(tool_call, repo_dir: str, all_projects: list[dict] | None = No
                     "The current idea will be blocked until this dependency is completed."
                 )
             return f"Error creating idea: HTTP {resp.status_code} — {resp.text[:200]}"
+
+        elif name == "query_table":
+            if not AZURE_TABLES_CONNECTION_STRING:
+                return "Error: AZURE_TABLES_CONNECTION_STRING not configured"
+            from azure.data.tables import TableServiceClient
+            table_name = args.get("table_name", "")
+            filter_expr = args.get("filter") or None
+            top = min(int(args.get("top", 5)), 20)
+            svc = TableServiceClient.from_connection_string(AZURE_TABLES_CONNECTION_STRING)
+            tc = svc.get_table_client(table_name)
+            entities = list(tc.list_entities(query_filter=filter_expr, results_per_page=top))[:top]
+            return json.dumps(entities, default=str, indent=2)
 
         else:
             return f"Error: unknown tool '{name}'"
@@ -623,7 +665,9 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         "- Do NOT push — the orchestrator handles that\n"
         "- After committing, stop calling tools and give a short plain-text summary\n"
         "- If completing this idea requires work in a different repository, call create_idea to "
-        "file that work as a dependency — do not clone or modify other repos yourself"
+        "file that work as a dependency — do not clone or modify other repos yourself\n"
+        "- Use query_table to inspect live Azure Table Storage data when you need to understand "
+        "record shapes, find existing entries, or validate data before writing code"
         f"{context_section}"
     )
     user_msg = (

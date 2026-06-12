@@ -1,3 +1,4 @@
 requests>=2.31.0
 openai>=1.30.0
+azure-data-tables>=12.5.0
 git+https://github.com/skarumbu/shared-logging.git#subdirectory=python
