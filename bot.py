@@ -137,6 +137,27 @@ def _exit(code: int, delay: int = 12) -> None:
     sys.exit(code)
 
 
+# ── repo context ───────────────────────────────────────────────────────────────
+def fetch_repo_context(repo: str) -> str:
+    """Fetch CLAUDE.md from the target repo to give the bot codebase context."""
+    url = f"https://raw.githubusercontent.com/{repo}/main/CLAUDE.md"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"token {GITHUB_PAT}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            content = resp.text.strip()
+            # Cap at 3000 chars to avoid bloating prompts
+            if len(content) > 3000:
+                content = content[:3000] + "\n...(truncated)"
+            return content
+    except Exception as exc:
+        log.warning(f"Could not fetch CLAUDE.md from {repo}: {exc}")
+    return ""
+
+
 # ── ideas-api helpers ──────────────────────────────────────────────────────────
 def _machine_headers() -> dict:
     return {"Content-Type": "application/json", "X-Ideas-Key": IDEAS_WRITE_KEY}
@@ -319,7 +340,8 @@ def dispatch_tool(tool_call, repo_dir: str, all_projects: list[dict] | None = No
 
 
 # ── pre-flight clarity check ───────────────────────────────────────────────────
-def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
+def assess_idea_clarity(idea: dict, repo_context: str = "") -> tuple[bool, str | None]:
+    context_block = f"\n\n## Repo context (CLAUDE.md)\n{repo_context}" if repo_context else ""
     response = _chat_complete(
         model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
@@ -331,7 +353,8 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
                     "Functions backend). Be permissive — most UI tweaks, new pages, and small "
                     "features have an obvious implementation. Only ask when the answer would "
                     "meaningfully fork the code path (e.g. which data to fetch, what the primary "
-                    "action is, whether backend changes are needed)."
+                    "action is, whether backend changes are needed). "
+                    "Use the repo context to answer structural questions yourself before asking the user."
                 ),
             },
             {
@@ -340,7 +363,8 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
                     f"Feature idea:\n"
                     f"Title: {idea['title']}\n"
                     f"Project: {idea.get('project', '')}\n"
-                    f"Description: {idea.get('body', '') or '(none)'}\n\n"
+                    f"Description: {idea.get('body', '') or '(none)'}"
+                    f"{context_block}\n\n"
                     f"Is this implementable without clarification?\n\n"
                     f"Rules:\n"
                     f"- Return clear=true if a skilled developer could make a reasonable "
@@ -348,6 +372,7 @@ def assess_idea_clarity(idea: dict) -> tuple[bool, str | None]:
                     f"- Only return clear=false when missing info would cause significantly "
                     f"different code — e.g. unknown data source, ambiguous primary action, "
                     f"unclear scope (1 page vs 5 pages)\n"
+                    f"- Questions answerable from the repo context above must NOT be asked\n"
                     f"- Do NOT ask about style, color, copy, or other preferences with obvious defaults\n"
                     f"- If asking, make the question concrete and answerable in 1-2 sentences\n\n"
                     f"Reply with JSON only:\n"
@@ -569,7 +594,8 @@ def watch_ci_and_repair(repo_slug: str, pr_number: str, repo_dir: str, branch: s
 
 
 # ── agent loop ─────────────────────────────────────────────────────────────────
-def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects: list[dict] | None = None, created_ideas: list[dict] | None = None) -> None:
+def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects: list[dict] | None = None, created_ideas: list[dict] | None = None, repo_context: str = "") -> None:
+    context_section = f"\n\n## Repo context (CLAUDE.md)\n{repo_context}" if repo_context else ""
     system = (
         "You are an expert software engineer implementing a feature from a backlog idea.\n"
         "Use the provided tools to explore the repo structure, understand the codebase, "
@@ -585,6 +611,7 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         "- After committing, stop calling tools and give a short plain-text summary\n"
         "- If completing this idea requires work in a different repository, call create_idea to "
         "file that work as a dependency — do not clone or modify other repos yourself"
+        f"{context_section}"
     )
     user_msg = (
         f"Project: {idea.get('project') or idea.get('feature_name', '')}\n"
@@ -731,8 +758,14 @@ def main() -> None:
     if not blocked_by_raw:
         set_bot_status("running")
 
+    repo_context = fetch_repo_context(repo)
+    if repo_context:
+        log.info(f"Fetched CLAUDE.md from {repo} ({len(repo_context)} chars)")
+    else:
+        log.info(f"No CLAUDE.md found for {repo}, proceeding without repo context")
+
     try:
-        is_clear, question = assess_idea_clarity(idea)
+        is_clear, question = assess_idea_clarity(idea, repo_context=repo_context)
     except Exception as exc:
         log.warning(f"Clarity check failed ({exc}), proceeding anyway")
         is_clear, question = True, None
@@ -823,7 +856,7 @@ def main() -> None:
             run_cmd(["git", "checkout", "-b", branch], cwd=repo_dir)
 
             log.info(f"Running agent ({AZURE_OPENAI_DEPLOYMENT}) on {repo}…")
-            run_agent(idea, repo_dir, prior_updates, all_projects=all_projects, created_ideas=created_ideas)
+            run_agent(idea, repo_dir, prior_updates, all_projects=all_projects, created_ideas=created_ideas, repo_context=repo_context)
 
             # If the agent created cross-repo dependencies, block and don't push
             if created_ideas:
