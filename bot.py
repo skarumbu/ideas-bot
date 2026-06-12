@@ -340,8 +340,18 @@ def dispatch_tool(tool_call, repo_dir: str, all_projects: list[dict] | None = No
 
 
 # ── pre-flight clarity check ───────────────────────────────────────────────────
-def assess_idea_clarity(idea: dict, repo_context: str = "") -> tuple[bool, str | None]:
+def assess_idea_clarity(idea: dict, repo_context: str = "", prior_updates: list[dict] | None = None) -> tuple[bool, str | None]:
     context_block = f"\n\n## Repo context (CLAUDE.md)\n{repo_context}" if repo_context else ""
+    prior_block = ""
+    if prior_updates:
+        lines = []
+        for u in prior_updates:
+            body = (u.get("body") or "").strip()
+            if body:
+                author = "Bot" if u.get("source", "").startswith("bot") else "User"
+                lines.append(f"{author}: {body}")
+        if lines:
+            prior_block = "\n\n## Prior Q&A (already asked — do NOT re-ask these or equivalent questions)\n" + "\n\n".join(lines)
     response = _chat_complete(
         model=AZURE_OPENAI_DEPLOYMENT,
         messages=[
@@ -364,7 +374,8 @@ def assess_idea_clarity(idea: dict, repo_context: str = "") -> tuple[bool, str |
                     f"Title: {idea['title']}\n"
                     f"Project: {idea.get('project', '')}\n"
                     f"Description: {idea.get('body', '') or '(none)'}"
-                    f"{context_block}\n\n"
+                    f"{context_block}"
+                    f"{prior_block}\n\n"
                     f"Is this implementable without clarification?\n\n"
                     f"Rules:\n"
                     f"- Return clear=true if a skilled developer could make a reasonable "
@@ -373,6 +384,8 @@ def assess_idea_clarity(idea: dict, repo_context: str = "") -> tuple[bool, str |
                     f"different code — e.g. unknown data source, ambiguous primary action, "
                     f"unclear scope (1 page vs 5 pages)\n"
                     f"- Questions answerable from the repo context above must NOT be asked\n"
+                    f"- Questions already asked in Prior Q&A above must NOT be re-asked\n"
+                    f"- If the user answered a prior question, treat that answer as resolved\n"
                     f"- Do NOT ask about style, color, copy, or other preferences with obvious defaults\n"
                     f"- If asking, make the question concrete and answerable in 1-2 sentences\n\n"
                     f"Reply with JSON only:\n"
@@ -764,8 +777,10 @@ def main() -> None:
     else:
         log.info(f"No CLAUDE.md found for {repo}, proceeding without repo context")
 
+    prior_updates = fetch_updates(IDEA_ID)
+
     try:
-        is_clear, question = assess_idea_clarity(idea, repo_context=repo_context)
+        is_clear, question = assess_idea_clarity(idea, repo_context=repo_context, prior_updates=prior_updates)
     except Exception as exc:
         log.warning(f"Clarity check failed ({exc}), proceeding anyway")
         is_clear, question = True, None
@@ -836,7 +851,6 @@ def main() -> None:
     safe_title = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower())[:40].strip("-")
     model_slug = re.sub(r"[^a-z0-9]+", "-", AZURE_OPENAI_DEPLOYMENT.lower())
     branch = f"bot/{date.today().isoformat()}-{model_slug}-{safe_title}"
-    prior_updates = fetch_updates(IDEA_ID)
 
     with tempfile.TemporaryDirectory(prefix="ideas-bot-") as work_dir:
         repo_dir = str(Path(work_dir) / "repo")
