@@ -690,7 +690,20 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         log.info(f"Agent round {round_num + 1}")
         # Keep system + user prompt + last N exchanges to bound context size.
         # Tool results can be large; trimming older ones reduces 429 risk.
-        context = messages[:2] + messages[2:][-14:] if len(messages) > 16 else messages
+        if len(messages) > 16:
+            tail = messages[2:][-14:]
+            # Never start the tail on a 'tool' message — it must be preceded by
+            # the assistant message that issued the tool_calls, which may have
+            # been trimmed. Skip forward until we hit a non-tool message.
+            while tail:
+                role = tail[0].role if hasattr(tail[0], "role") else tail[0].get("role")
+                if role == "tool":
+                    tail = tail[1:]
+                else:
+                    break
+            context = messages[:2] + tail
+        else:
+            context = messages
         response = _chat_complete(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=context,
