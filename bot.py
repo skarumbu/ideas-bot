@@ -400,13 +400,14 @@ def assess_idea_clarity(idea: dict, repo_context: str = "", prior_updates: list[
             {
                 "role": "system",
                 "content": (
-                    "You assess software feature ideas for autonomous implementation clarity. "
-                    "The project is a personal web app (React + TypeScript frontend, Python Azure "
-                    "Functions backend). Be permissive — most UI tweaks, new pages, and small "
-                    "features have an obvious implementation. Only ask when the answer would "
-                    "meaningfully fork the code path (e.g. which data to fetch, what the primary "
-                    "action is, whether backend changes are needed). "
-                    "Use the repo context to answer structural questions yourself before asking the user."
+                    "You gate autonomous implementation of software ideas. Your default answer is clear=true. "
+                    "The implementing agent will clone the repo and read all the code — so any question "
+                    "answerable by looking at existing files, patterns, endpoints, or schemas must NOT be asked. "
+                    "Only block on missing business/product intent that cannot be inferred from code or context: "
+                    "e.g. which of two genuinely opposite product behaviours the user wants, or a hard external "
+                    "dependency (an API key, a third-party service) that cannot be assumed. "
+                    "Implementation details (field names, response shape, auth pattern, file structure, "
+                    "test style) are always resolvable from the codebase — never ask about them."
                 ),
             },
             {
@@ -420,18 +421,18 @@ def assess_idea_clarity(idea: dict, repo_context: str = "", prior_updates: list[
                     f"{prior_block}\n\n"
                     f"Is this implementable without clarification?\n\n"
                     f"Rules:\n"
-                    f"- Return clear=true if a skilled developer could make a reasonable "
-                    f"implementation decision on their own\n"
-                    f"- Only return clear=false when missing info would cause significantly "
-                    f"different code — e.g. unknown data source, ambiguous primary action, "
-                    f"unclear scope (1 page vs 5 pages)\n"
-                    f"- Questions answerable from the repo context above must NOT be asked\n"
-                    f"- Questions already asked in Prior Q&A above must NOT be re-asked\n"
-                    f"- If the user answered a prior question, treat that answer as resolved\n"
-                    f"- Do NOT ask about style, color, copy, or other preferences with obvious defaults\n"
-                    f"- If asking, make the question concrete and answerable in 1-2 sentences\n\n"
+                    f"- Default to clear=true — when in doubt, let the agent proceed\n"
+                    f"- Return clear=false ONLY when there is a genuine product-level ambiguity "
+                    f"where two opposite choices are equally plausible and the wrong choice wastes "
+                    f"the entire implementation\n"
+                    f"- NEVER ask about anything a developer could determine by reading the repo "
+                    f"(structure, patterns, existing endpoints, schemas, auth, style)\n"
+                    f"- NEVER ask about style, copy, color, or preference questions\n"
+                    f"- If Prior Q&A exists: treat ALL questions in the same domain as the answered "
+                    f"questions as already resolved — do not ask follow-ups in the same topic area\n"
+                    f"- If the user answered any prior question, assume they want the agent to proceed\n\n"
                     f"Reply with JSON only:\n"
-                    f"{{\"clear\": true}} OR {{\"clear\": false, \"question\": \"<specific question>\"}}"
+                    f"{{\"clear\": true}} OR {{\"clear\": false, \"question\": \"<one concrete question>\"}}"
                 ),
             },
         ],
