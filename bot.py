@@ -490,10 +490,17 @@ def decompose_idea(idea: dict, repo: str, all_projects: list[dict] | None = None
                     "- Title must be specific and self-contained\n"
                     f"- Body must describe what to implement and end with: "
                     f"'Part of: {idea['title']} (idea #{IDEA_ID})'\n\n"
+                    "Rules for ordering:\n"
+                    "- Assign each sub-task an 'order' integer starting at 1\n"
+                    "- If a sub-task cannot start until a previous one is merged (e.g. frontend "
+                    "depends on backend schema/API), set 'depends_on_previous': true on it\n"
+                    "- Sub-tasks with depends_on_previous=true will be blocked until the prior "
+                    "sub-task completes, so only mark it when there is a real hard dependency\n\n"
                     "Reply with JSON only:\n"
                     '{"decompose": false} OR\n'
                     '{"decompose": true, "subtasks": ['
-                    '{"title": "...", "body": "...", "project_name": "<exact project name>"}]}'
+                    '{"title": "...", "body": "...", "project_name": "<exact project name>", '
+                    '"order": 1, "depends_on_previous": false}]}'
                 ),
             },
         ],
@@ -885,13 +892,19 @@ def main() -> None:
 
         if subtasks:
             child_ideas = []
-            for st in subtasks:
+            subtasks_sorted = sorted(subtasks, key=lambda s: s.get("order", 99))
+            for st in subtasks_sorted:
                 st_project_name = st.get("project_name") or project_name
                 st_project = next((p for p in all_projects if p["name"] == st_project_name), None)
                 if not st_project:
                     st_project_name = project_name
                     st_project = next((p for p in all_projects if p["name"] == project_name), None)
                 log.info(f"Creating subtask '{st['title']}' in project '{st_project_name}'")
+
+                # Chain: if this subtask depends on the previous one, block it immediately
+                predecessor = child_ideas[-1] if (st.get("depends_on_previous") and child_ideas) else None
+                blocked_by = json.dumps([{**predecessor, "type": "subtask"}]) if predecessor else None
+
                 resp = requests.post(
                     f"{IDEAS_API_URL}/api/ideas",
                     headers=_machine_headers(),
@@ -901,6 +914,7 @@ def main() -> None:
                         "title": st["title"],
                         "body": st["body"],
                         "source": f"bot:subtask:{IDEA_ID}",
+                        **({"bot_status": "blocked", "bot_blocked_by": blocked_by} if blocked_by else {}),
                     },
                     timeout=15,
                 )
