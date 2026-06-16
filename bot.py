@@ -686,6 +686,7 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         {"role": "system", "content": system},
         {"role": "user", "content": user_msg},
     ]
+    last_text: str = ""
 
     MAX_ROUNDS = 60
     WRAP_UP_AT = 50
@@ -719,7 +720,8 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         messages.append(msg)
 
         if not msg.tool_calls:
-            log.info(f"Agent finished: {msg.content[:200] if msg.content else '(no text)'}")
+            last_text = msg.content or ""
+            log.info(f"Agent finished: {last_text[:200]}")
             break
 
         for tc in msg.tool_calls:
@@ -747,6 +749,8 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         subprocess.run("git add -A && git commit -m 'bot: partial implementation (round limit hit)' || true",
                        shell=True, cwd=repo_dir)
         raise RuntimeError(f"Agent exceeded {MAX_ROUNDS} rounds without finishing")
+
+    return last_text
 
 
 # ── PR body ────────────────────────────────────────────────────────────────────
@@ -946,7 +950,7 @@ def main() -> None:
             run_cmd(["git", "checkout", "-b", branch], cwd=repo_dir)
 
             log.info(f"Running agent ({AZURE_OPENAI_DEPLOYMENT}) on {repo}…")
-            run_agent(idea, repo_dir, prior_updates, all_projects=all_projects, created_ideas=created_ideas, repo_context=repo_context)
+            agent_summary = run_agent(idea, repo_dir, prior_updates, all_projects=all_projects, created_ideas=created_ideas, repo_context=repo_context)
 
             # If the agent created cross-repo dependencies, block and don't push
             if created_ideas:
@@ -966,7 +970,11 @@ def main() -> None:
 
             ahead = capture_cmd(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo_dir)
             if ahead == "0":
-                raise RuntimeError(f"Agent made no commits in {repo} — nothing to push")
+                msg = agent_summary or "Agent made no changes and left no explanation."
+                log.warning(f"No commits made. Agent said: {msg[:300]}")
+                post_bot_update(IDEA_ID, f"I couldn't find anything to implement:\n\n{msg}\n\nPlease clarify or re-trigger.")
+                set_bot_status("needs_info", error="Agent made no commits")
+                _exit(0)
 
             run_cmd(
                 ["git", "push", "origin", branch],
