@@ -687,7 +687,10 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
         {"role": "user", "content": user_msg},
     ]
 
-    for round_num in range(40):
+    MAX_ROUNDS = 60
+    WRAP_UP_AT = 50
+
+    for round_num in range(MAX_ROUNDS):
         log.info(f"Agent round {round_num + 1}")
         # Keep system + user prompt + last N exchanges to bound context size.
         # Tool results can be large; trimming older ones reduces 429 risk.
@@ -727,8 +730,23 @@ def run_agent(idea: dict, repo_dir: str, prior_updates: list[dict], all_projects
                 "tool_call_id": tc.id,
                 "content": result,
             })
+
+        if round_num + 1 == WRAP_UP_AT:
+            log.warning(f"Agent approaching round limit — injecting wrap-up nudge")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You are approaching the maximum number of rounds. "
+                    "Commit whatever you have completed so far with "
+                    "git add -A && git commit -m 'bot: partial implementation (round limit approached)', "
+                    "then stop calling tools and give a short summary of what was done and what remains."
+                ),
+            })
     else:
-        raise RuntimeError("Agent exceeded 40 rounds without finishing")
+        log.error("Agent hit round limit — committing any uncommitted work")
+        subprocess.run("git add -A && git commit -m 'bot: partial implementation (round limit hit)' || true",
+                       shell=True, cwd=repo_dir)
+        raise RuntimeError(f"Agent exceeded {MAX_ROUNDS} rounds without finishing")
 
 
 # ── PR body ────────────────────────────────────────────────────────────────────
