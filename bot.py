@@ -44,8 +44,16 @@ oai = AzureOpenAI(
     timeout=120.0,       # per-request timeout in seconds
 )
 
+REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+
+
 def _chat_complete(**kwargs):
     """Wrapper around oai.chat.completions.create with app-level 429 retry."""
+    model = kwargs.get("model", "")
+    if model.startswith(REASONING_MODEL_PREFIXES) and "max_tokens" in kwargs:
+        # Reasoning-tuned models (o-series, gpt-5.x) reject max_tokens/temperature
+        # in favor of max_completion_tokens.
+        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
     for attempt in range(4):
         try:
             return oai.chat.completions.create(**kwargs)  # noqa: direct call inside wrapper
